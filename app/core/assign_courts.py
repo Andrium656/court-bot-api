@@ -1,31 +1,20 @@
 import os
-import requests
 import time
 import hashlib
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from geopy.distance import geodesic
-import urllib.parse
+from typing import Optional
 
 load_dotenv()
 
-DB_HOST = os.getenv('DB_HOST')
-DB_PORT = os.getenv('DB_PORT', '3306')
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = urllib.parse.quote_plus(os.getenv('DB_PASSWORD'))
-DB_NAME = os.getenv('DB_NAME')
-GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
-
-DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# Configuración de BD y funciones de API
+from app.utils.database import DB_NAMES, get_database_url
+from app.utils.google_api import geocode_address_with_logging, get_distance_matrix_with_logging
 
 
 def calculate_client_hash(lawsuit_id, address, neighborhood, city, department, type_quantity):
-    """
-    Calcula un hash único basado en los datos relevantes del cliente
-    
-    Si este hash NO cambia = Los datos son los mismos = NO llamar a API
-    """
-    # Crear string con todos los datos relevantes (usar cadenas vacías para None)
+    """Calcula hash para el cliente"""
     data_string = (
         f"{lawsuit_id}|"
         f"{address or ''}|"
@@ -34,157 +23,111 @@ def calculate_client_hash(lawsuit_id, address, neighborhood, city, department, t
         f"{department or ''}|"
         f"{type_quantity or ''}"
     )
-    
-    # Calcular hash SHA256
     return hashlib.sha256(data_string.encode('utf-8')).hexdigest()
 
 
 def normalize_city(city):
-    """Normaliza nombre de ciudad (mayúsculas, sin espacios extra)"""
+    """Normalizar nombre ciudad (mayúsculas, sin espacios extra)"""
     if not city:
         return None
     return city.strip().upper()
 
 
-def geocode_address(address, city, department=None, neighborhood=None):
+def cities_match(city1, city2):
     """
-    Geocodifica una dirección usando Google Maps y valida la ciudad
+    Compara dos ciudades considerando variantes de Bogotá como equivalentes
     
     Args:
-        address: Dirección del cliente
-        city: Ciudad del cliente
-        department: Departamento del cliente (opcional pero recomendado)
-        neighborhood: Barrio del cliente (opcional)
+        city1: Primera ciudad a comparar
+        city2: Segunda ciudad a comparar
     
     Returns:
-        tuple: (lat, lng, found_city) o (None, None, None) si falla
+        bool: True si las ciudades son equivalentes, False si no
     """
-    # Incrementar contador ANTES de hacer la llamada
-    from app.bot_control import BotController
-    BotController.increment_api_calls()
+    if not city1 or not city2:
+        return False
+    
+    #normalizar a mayúsculas y quitar espacios
+    city1_norm = city1.strip().upper()
+    city2_norm = city2.strip().upper()
+    if city1_norm == city2_norm:
+        return True
 
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    
-    # Construir dirección completa: dirección, barrio, ciudad, departamento, país
-    address_parts = [address]
-    
-    if neighborhood:
-        address_parts.append(neighborhood)
-    
-    address_parts.append(city)
-    
-    if department:
-        address_parts.append(department)
-    
-    address_parts.append("Colombia")
-    
-    full_address = ", ".join(address_parts)
-    
-    params = {
-        'address': full_address,
-        'key': GOOGLE_API_KEY
+    bogota_variants = {
+        "BOGOTA",
+        "BOGOTÁ",
+        "BOGOTA D.C.",
+        "BOGOTÁ D.C.",
+        "BOGOTA, D.C.",
+        "BOGOTÁ, D.C.",
+        "BOGOTA DC",
+        "BOGOTÁ DC",
+        "BOGOTA D C",
+        "BOGOTÁ D C"
     }
-    
-    try:
-        response = requests.get(url, params=params)
-        data = response.json()
-        
-        if data['status'] == 'OK':
-            result = data['results'][0]
-            location = result['geometry']['location']
-            
-            # Extraer ciudad de los componentes de dirección
-            found_city = None
-            for component in result['address_components']:
-                if 'locality' in component['types']:
-                    found_city = component['long_name']
-                    break
-                elif 'administrative_area_level_2' in component['types']:
-                    found_city = component['long_name']
-                    break
-            
-            return location['lat'], location['lng'], found_city
-        else:
-            print(f"      ⚠️  Error geocodificación: {data['status']}")
-            return None, None, None
-            
-    except Exception as e:
-        print(f"      ❌ Error en API: {str(e)}")
-        return None, None, None
+
+    if city1_norm in bogota_variants and city2_norm in bogota_variants:
+        return True
+    return False
 
 
-def get_distance_matrix(origin_lat, origin_lng, destinations):
+def get_city_search_variants(city):
     """
-    Calcula distancias reales por carretera usando Google Distance Matrix API
+    Obtiene las variantes de búsqueda para una ciudad
+    Para Bogotá devuelve todas las variantes comunes, para otras ciudades solo la normalizada
     
-    destinations: lista de tuplas (lat, lng, court_id, court_name)
+    Args:
+        city: Nombre de la ciudad
+    
+    Returns:
+        list: Lista de variantes de búsqueda
     """
-    if not destinations:
+    if not city:
         return []
+    
+    normalized = normalize_city(city)
 
-    # Incrementar contador ANTES de hacer la llamada
-    from app.bot_control import BotController
-    BotController.increment_api_calls()
-    
-    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    
-    origin = f"{origin_lat},{origin_lng}"
-    dest_coords = [f"{lat},{lng}" for lat, lng, _, _ in destinations]
-    
-    params = {
-        'origins': origin,
-        'destinations': '|'.join(dest_coords),
-        'key': GOOGLE_API_KEY,
-        'mode': 'driving',
-        'units': 'metric'
+    bogota_variants = {
+        "BOGOTA",
+        "BOGOTÁ",
+        "BOGOTA D.C.",
+        "BOGOTÁ D.C.",
+        "BOGOTA, D.C.",
+        "BOGOTÁ, D.C.",
+        "BOGOTA DC",
+        "BOGOTÁ DC"
     }
-    
-    try:
-        response = requests.get(url, params=params)
-        data = response.json()
-        
-        if data['status'] == 'OK':
-            results = []
-            elements = data['rows'][0]['elements']
-            
-            for i, element in enumerate(elements):
-                if element['status'] == 'OK':
-                    distance_km = element['distance']['value'] / 1000
-                    lat, lng, court_id, court_name = destinations[i]
-                    results.append({
-                        'court_id': court_id,
-                        'court_name': court_name,
-                        'distance_km': distance_km,
-                        'lat': lat,
-                        'lng': lng
-                    })
-            
-            return sorted(results, key=lambda x: x['distance_km'])
-        
-        return []
-        
-    except Exception as e:
-        print(f"      ❌ Error en Distance Matrix: {str(e)}")
-        return []
 
+    if normalized in bogota_variants:
+        return list(bogota_variants)
 
-def process_pending_lawsuits(limit=None):
+    return [normalized]
+
+def process_pending_lawsuits_single_db(db_name: str, limit: Optional[int] = None):
     """
-    Procesa demandas pendientes y asigna/actualiza juzgados
+    Procesa demandas pendientes y asigna/actualiza juzgados para UNA base de datos
     
-    ✅ OPTIMIZADO: Solo geocodifica si los datos del cliente cambiaron (usando hash)
+    Args:
+        db_name: Nombre de la base de datos
+        limit: Número máximo de demandas a procesar (None = todas)
     
-    REGLAS:
-    1. Calcular hash de datos del cliente (lawsuit_id, dirección, barrio, ciudad, departamento, cuantía)
-    2. Si el hash es igual al guardado Y ya tiene juzgado asignado → OMITIR (ahorra llamadas API)
-    3. Si el hash cambió O no tiene juzgado → PROCESAR
-    4. Actualizar hash después de procesar
+    Returns:
+        dict: Estadísticas del procesamiento
     """
-    engine = create_engine(DATABASE_URL, echo=False)
+    from app.bot_control import BotController
+    
+    print("\n" + "=" * 70)
+    print(f"⚙️ PROCESANDO ASIGNACIONES - BD: {db_name}")
+    print("=" * 70)
+    
+    BotController.log(f"⚙️ Iniciando procesamiento de asignaciones - BD: {db_name}", "INFO")
+    
+    database_url = get_database_url(db_name)
+    engine = create_engine(database_url, echo=False)
     
     with engine.connect() as connection:
         
-        #obtener demandas activas pero pendientes
+        # Obtener demandas activas y pendientes
         query = """
             SELECT 
                 l.id as lawsuit_id,
@@ -212,9 +155,23 @@ def process_pending_lawsuits(limit=None):
         
         if not lawsuits:
             print("\n✅ No hay demandas pendientes para procesar")
-            return
+            BotController.log(f"✅ [{db_name}] No hay demandas pendientes", "INFO")
+            return {
+                "db_name": db_name,
+                "total_procesados": 0,
+                "success": 0,
+                "no_address": 0,
+                "no_court_in_city": 0,
+                "wrong_city": 0,
+                "error": 0,
+                "updated": 0,
+                "inserted": 0,
+                "skipped": 0,
+                "api_calls_saved": 0
+            }
         
         print(f"\n📋 Demandas a procesar: {len(lawsuits)}")
+        BotController.log(f"📋 [{db_name}] Procesando {len(lawsuits)} demandas", "INFO")
         print("=" * 70)
         
         success_count = 0
@@ -225,6 +182,7 @@ def process_pending_lawsuits(limit=None):
         updated_count = 0
         inserted_count = 0
         skipped_count = 0
+        api_calls_saved_count = 0
         
         for i, lawsuit in enumerate(lawsuits, 1):
             lawsuit_id = lawsuit[0]
@@ -240,7 +198,7 @@ def process_pending_lawsuits(limit=None):
             print(f"   Tipo cuantía: {type_quantity}")
             print(f"   Ciudad: {client_city or 'N/A'}")
             
-            # Calcular hash y verificar si cambio
+            # Calcular hash y verificar si cambió
             current_hash = calculate_client_hash(
                 lawsuit_id,
                 client_address,
@@ -263,22 +221,84 @@ def process_pending_lawsuits(limit=None):
                 stored_hash = existing[1]
                 existing_court = existing[2]
                 
-                #si el hash es igual Y ya tiene juzgado asignado → OMITIR
+                # Solo omitir si el hash es igual Y tiene juzgado asignado válido
                 if stored_hash == current_hash and existing_court and existing_court not in [
                     "Sin dirección",
                     "Error en geocodificación",
                     "Dirección incorrecta o en otra ciudad",
                     "No se encuentra juzgado en ciudad"
                 ]:
-                    print(f"   ⏭️  Sin cambios detectados - Omitiendo (ahorrando llamadas API)")
+                    BotController.log(
+                        f"⏭️ [{db_name}] Cliente {client_identification} sin cambios - Omitido",
+                        "INFO"
+                    )
                     skipped_count += 1
                     continue
+                
+                # Si el hash NO cambió Y tiene "No se encuentra juzgado en ciudad"
+                # Verificar si AHORA sí hay juzgados disponibles
+                if stored_hash == current_hash and existing_court == "No se encuentra juzgado en ciudad":
+                    # Validar que tenga dirección y ciudad
+                    if not client_address or not client_city:
+                        skipped_count += 1
+                        continue
+                    
+                    # 🔥 CAMBIO: Buscar con variantes de Bogotá
+                    search_cities = get_city_search_variants(client_city)
+                    
+                    # Construir query con OR para múltiples variantes
+                    city_conditions = " OR ".join([f"UPPER(TRIM(dc.city)) = :city{idx}" for idx in range(len(search_cities))])
+                    
+                    courts_check_query = text(f"""
+                        SELECT COUNT(*) 
+                        FROM data_courts dc
+                        INNER JOIN court_coordinates cc ON dc.id = cc.court_id
+                        WHERE dc.status = 'Activo'
+                        AND dc.deleted_at IS NULL
+                        AND cc.deleted_at IS NULL
+                        AND dc.type_cuantity = :cuantia
+                        AND ({city_conditions})
+                    """)
+                    
+                    # Construir parámetros dinámicos
+                    params = {"cuantia": type_quantity}
+                    for idx, city_variant in enumerate(search_cities):
+                        params[f"city{idx}"] = city_variant
+                    
+                    result_check = connection.execute(courts_check_query, params)
+                    courts_available = result_check.fetchone()[0]
+                    
+                    # Si no hay juzgados - omitir la llamada a la API
+                    if courts_available == 0:
+                        print(f"   ⏭️  Sigue sin haber juzgados en {client_city} - Omitiendo (ahorrando API)")
+                        BotController.log(
+                            f"💰 [{db_name}] Cliente {client_identification} - Sin juzgados en {client_city} - 2 llamadas API ahorradas",
+                            "INFO"
+                        )
+                        skipped_count += 1
+                        api_calls_saved_count += 2
+                        continue
+                    else:
+                        # Si hay juzgados - llamar a la api
+                        print(f"   🔄 Ahora SÍ hay juzgados en {client_city} ({courts_available} disponibles) - Reintentando asignación")
+                        BotController.log(
+                            f"🔄 [{db_name}] Cliente {client_identification} - Detectados {courts_available} juzgados nuevos en {client_city} - Reintentando",
+                            "INFO"
+                        )
+                
+                # En cualquier otro caso, actualizar
+                if existing_court in [
+                    "Sin dirección",
+                    "Error en geocodificación",
+                    "Dirección incorrecta o en otra ciudad"
+                ] and stored_hash == current_hash:
+                    print(f"   🔄 Actualizando registro existente (ID: {existing_id}) - Datos cambiaron o reintentando")
                 else:
-                    print(f"   🔄 Actualizando registro existente (ID: {existing_id}) - Datos cambiaron")
+                    print(f"   🔄 Actualizando registro existente (ID: {existing_id})")
             else:
                 print(f"   🆕 Creando nuevo registro")
             
-            #validaqr que tenga direccion y ciudad
+            # Validar que tenga dirección y ciudad
             if not client_address or not client_city:
                 print(f"   ⚠️  Sin dirección válida")
                 
@@ -329,16 +349,17 @@ def process_pending_lawsuits(limit=None):
                 connection.commit()
                 no_address_count += 1
                 continue
-                
-            #geocodificar direccion del cliente
+            
+            # Geocodificar dirección del cliente
             full_address = f"{client_address}, {client_neighborhood or ''}, {client_city}"
             print(f"   📍 Geocodificando: {full_address}")
             
-            client_lat, client_lng, found_city = geocode_address(
+            client_lat, client_lng, found_city = geocode_address_with_logging(
                 client_address,
                 client_city,
                 client_department,
-                client_neighborhood
+                client_neighborhood,
+                db_name=db_name
             )
             
             if not client_lat or not client_lng:
@@ -395,12 +416,9 @@ def process_pending_lawsuits(limit=None):
             print(f"   ✅ Coordenadas: ({client_lat}, {client_lng})")
             print(f"   🏙️  Ciudad encontrada: {found_city or 'N/A'}")
             
-            #validar que la dirección esté en la ciudad correcta
+            #alidar que la dirección esté en la ciudad correcta usando cities_match()
             if found_city:
-                normalized_found_city = normalize_city(found_city)
-                normalized_client_city = normalize_city(client_city)
-                
-                if normalized_found_city != normalized_client_city:
+                if not cities_match(found_city, client_city):
                     print(f"   ⚠️  Dirección geocodificada en ciudad diferente")
                     print(f"       Esperada: {client_city}")
                     print(f"       Encontrada: {found_city}")
@@ -453,10 +471,12 @@ def process_pending_lawsuits(limit=None):
                     wrong_city_count += 1
                     continue
             
-            #buscar juzgados en la ciudad del cliente y del tipo de cuantía
-            normalized_city = normalize_city(client_city)
+            #Buscar juzgados con variantes de Bogotá
+            search_cities = get_city_search_variants(client_city)
+
+            city_conditions = " OR ".join([f"UPPER(TRIM(dc.city)) = :city{idx}" for idx in range(len(search_cities))])
             
-            courts_query = text("""
+            courts_query = text(f"""
                 SELECT 
                     dc.id,
                     dc.name,
@@ -471,13 +491,15 @@ def process_pending_lawsuits(limit=None):
                 AND dc.deleted_at IS NULL
                 AND cc.deleted_at IS NULL
                 AND dc.type_cuantity = :cuantia
-                AND UPPER(TRIM(dc.city)) = :city
+                AND ({city_conditions})
             """)
             
-            result = connection.execute(courts_query, {
-                "cuantia": type_quantity,
-                "city": normalized_city
-            })
+            # Construir parámetros dinámicos
+            params = {"cuantia": type_quantity}
+            for idx, city_variant in enumerate(search_cities):
+                params[f"city{idx}"] = city_variant
+            
+            result = connection.execute(courts_query, params)
             courts = result.fetchall()
             
             if not courts:
@@ -535,7 +557,7 @@ def process_pending_lawsuits(limit=None):
             
             print(f"   🏛️  Juzgados encontrados en {client_city}: {len(courts)}")
             
-            #calcular distancias en línea recta y ordenar
+            # Calcular distancias en línea recta
             courts_with_distance = []
             
             for court in courts:
@@ -559,14 +581,19 @@ def process_pending_lawsuits(limit=None):
             
             courts_with_distance.sort(key=lambda x: x['straight_distance'])
             top_courts = courts_with_distance[:5]
-            
-            #calcular distancias reales usando Matrix API
+
+            # Calcular distancias reales con logging
             destinations = [
                 (c['lat'], c['lng'], c['court_id'], c['court_name'])
                 for c in top_courts
             ]
             
-            real_distances = get_distance_matrix(client_lat, client_lng, destinations)
+            real_distances = get_distance_matrix_with_logging(
+                client_lat, 
+                client_lng, 
+                destinations,
+                db_name=db_name
+            )
             
             if not real_distances:
                 print(f"   ⚠️  Error al calcular distancias reales, usando línea recta")
@@ -580,7 +607,7 @@ def process_pending_lawsuits(limit=None):
                 )
                 final_distance = closest_court_data['distance_km']
             
-            #guardar asignación dejuzgado
+            # Guardar asignación de juzgado
             print(f"   ✅ Juzgado asignado: {closest_court['court_name']}")
             print(f"   📏 Distancia: {final_distance:.2f} km")
             
@@ -637,10 +664,9 @@ def process_pending_lawsuits(limit=None):
             connection.commit()
             success_count += 1
             time.sleep(0.1)
-        
-        #resumen final
+
         print("\n" + "=" * 70)
-        print("📊 RESUMEN DE PROCESAMIENTO")
+        print(f"📊 RESUMEN - BD: {db_name}")
         print("=" * 70)
         print(f"✅ Juzgados asignados: {success_count}")
         print(f"🔄 Registros actualizados: {updated_count}")
@@ -651,8 +677,93 @@ def process_pending_lawsuits(limit=None):
         print(f"⚠️  Sin juzgado en ciudad: {no_court_in_city_count}")
         print(f"❌ Errores: {error_count}")
         print(f"📋 Total procesados: {len(lawsuits)}")
-        print(f"💰 Llamadas API ahorradas: ~{skipped_count * 2}")
+        print(f"💰 Llamadas API ahorradas (hash): ~{(skipped_count - api_calls_saved_count) * 2}")
+        print(f"💰 Llamadas API ahorradas (sin juzgados): {api_calls_saved_count}")
+        print(f"💰 TOTAL llamadas API ahorradas: ~{(skipped_count * 2) + api_calls_saved_count}")
         print("=" * 70)
+        
+        BotController.log(
+            f"✅ [{db_name}] Procesamiento completado - "
+            f"Asignados: {success_count}, Omitidos: {skipped_count}, "
+            f"API ahorradas: {(skipped_count * 2) + api_calls_saved_count}",
+            "INFO"
+        )
+        
+        return {
+            "db_name": db_name,
+            "total_procesados": len(lawsuits),
+            "success": success_count,
+            "no_address": no_address_count,
+            "no_court_in_city": no_court_in_city_count,
+            "wrong_city": wrong_city_count,
+            "error": error_count,
+            "updated": updated_count,
+            "inserted": inserted_count,
+            "skipped": skipped_count,
+            "api_calls_saved": api_calls_saved_count
+        }
+
+
+def process_pending_lawsuits(limit: Optional[int] = None):
+    """
+    Procesa demandas pendientes en TODAS las bases de datos configuradas
+    
+    Args:
+        limit: Número máximo de demandas a procesar por BD (None = todas)
+    """
+    from app.bot_control import BotController
+
+    print("🚀 INICIANDO PROCESAMIENTO MULTI-BASE DE DATOS")
+    
+    BotController.log(f"🚀 Iniciando procesamiento en {len(DB_NAMES)} bases de datos", "INFO")
+    
+    results = []
+    
+    for i, db_name in enumerate(DB_NAMES, 1):
+        print(f"📦 BASE DE DATOS {i}/{len(DB_NAMES)}: {db_name}")
+        
+        try:
+            result = process_pending_lawsuits_single_db(db_name, limit)
+            results.append(result)
+        except Exception as e:
+            error_msg = str(e)
+            BotController.log(f"❌ Error en BD {db_name}: {error_msg}", "ERROR")
+            print(f"\n❌ ERROR: {error_msg}")
+            results.append({
+                "db_name": db_name,
+                "error": error_msg,
+                "total_procesados": 0,
+                "success": 0,
+                "api_calls_saved": 0
+            })
+    
+    # Resumen de todo
+    print("📊 RESUMEN GLOBAL DE PROCESAMIENTO")
+    
+    total_success = sum(r.get("success", 0) for r in results)
+    total_procesados = sum(r.get("total_procesados", 0) for r in results)
+    total_skipped = sum(r.get("skipped", 0) for r in results)
+    total_api_saved = sum(r.get("api_calls_saved", 0) for r in results)
+    
+    for result in results:
+        db_name = result["db_name"]
+        if "error" in result:
+            print(f"❌ {db_name}: ERROR - {result['error']}")
+        else:
+            print(f"✅ {db_name}: {result['success']} asignados, {result.get('api_calls_saved', 0)} API ahorradas")
+    
+    print(f"\n📊 TOTALES:")
+    print(f"   Total procesados: {total_procesados}")
+    print(f"   Total asignados: {total_success}")
+    print(f"   Total omitidos: {total_skipped}")
+    print(f"   💰 TOTAL llamadas API ahorradas: {total_api_saved}")
+    
+    BotController.log(
+        f"🏁 Procesamiento completado: {total_success} asignaciones, {total_api_saved} API ahorradas en {len(DB_NAMES)} BDs",
+        "INFO"
+    )
+    
+    print("-" * 35)
 
 
 if __name__ == "__main__":

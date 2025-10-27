@@ -33,26 +33,27 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
 )
 
-# ============================================================
-# MODO DESARROLLO
-# ============================================================
-
-# Descomentar esto para DESARROLLO
+#pruebas locales
 celery_app.conf.beat_schedule = {
     'test-sync-and-assign-2-3pm': {
         'task': 'app.tasks.scheduled_sync_and_assign',
         'schedule': crontab(
             minute='*/5',
-            hour='8-17',
-            day_of_week='mon-fri',
+            hour='7-23',
+            day_of_week='mon-sun',
+        ),
+    },
+    'reset-daily-api-counter': {
+        'task': 'app.tasks.reset_daily_api_counter',
+        'schedule': crontab(
+            minute=55,
+            hour=7,
         ),
     },
 }
 
-# ============================================================
-# MODO PRODUCCIÓN
-# ============================================================
 
+#producción
 # celery_app.conf.beat_schedule = {
 #     'prod-sync-and-assign-business-hours': {
 #         'task': 'app.tasks.scheduled_sync_and_assign',

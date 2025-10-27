@@ -1,57 +1,42 @@
 services:
-  # Redis (broker para Celery)
   redis:
     image: redis:7-alpine
     container_name: court-bot-redis
     restart: unless-stopped
-    # ports:
-    #   - "6379:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - court-bot-network
+    environment:
+      - TZ=America/Bogota
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
-    networks:
-      - court-bot-network
-    environment:
-      - TZ=America/Bogota
-    
 
-  # API FastAPI
   api:
     build:
-      context: .
+      context: ./
       dockerfile: Dockerfile
     container_name: court-bot-api
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "8001:8001"
     env_file:
       - .env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
       - TZ=America/Bogota
-    depends_on:
-      redis:
-        condition: service_healthy
     volumes:
       - ./logs:/app/logs
       - ./bot_state.json:/app/bot_state.json
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - court-bot-network
-      - default
 
-  # Celery Worker - ejecuta las tareas desdem el fastapi
   celery-worker:
     build:
       context: .
@@ -61,20 +46,17 @@ services:
     env_file:
       - .env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
       - TZ=America/Bogota
-    depends_on:
-      redis:
-        condition: service_healthy
     volumes:
       - ./logs:/app/logs
       - ./bot_state.json:/app/bot_state.json
     command: celery -A app.celery_app worker --loglevel=info --pool=solo
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - court-bot-network
 
-  # Celery Beat (Programador de tareas)
   celery-beat:
     build:
       context: .
@@ -84,38 +66,33 @@ services:
     env_file:
       - .env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
       - TZ=America/Bogota
-    depends_on:
-      redis:
-        condition: service_healthy
     volumes:
       - ./logs:/app/logs
       - ./bot_state.json:/app/bot_state.json
     command: celery -A app.celery_app beat --loglevel=info
+    depends_on:
+      redis:
+        condition: service_healthy
     networks:
       - court-bot-network
 
-  # Flower
   flower:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: court-bot-flower
     restart: unless-stopped
-    # ports:
-    #   - "5555:5555"
+    ports:
+      - "5555:5555"
     env_file:
       - .env
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
       - TZ=America/Bogota
+    command: celery -A app.celery_app flower --port=5555
     depends_on:
       redis:
         condition: service_healthy
-    command: celery -A app.celery_app flower --port=5555
     networks:
       - court-bot-network
 
@@ -125,4 +102,4 @@ volumes:
 
 networks:
   court-bot-network:
-    internal: true
+    driver: bridge

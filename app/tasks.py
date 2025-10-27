@@ -1,140 +1,179 @@
+from celery import Celery
 from app.celery_app import celery_app
+from app.bot_control import BotController, BotStatus
 from app.core.geocode_courts import sync_court_coordinates
 from app.core.assign_courts import process_pending_lawsuits
-from app.bot_control import BotController, BotStatus
+from app.utils.database import DB_NAMES, get_database_url
+from sqlalchemy import create_engine, text
 from datetime import datetime
-import logging
+import pytz
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+COLOMBIA_TZ = pytz.timezone('America/Bogota')
 
 
 @celery_app.task(name='app.tasks.scheduled_sync_and_assign')
 def scheduled_sync_and_assign():
     """
-    Tarea PROGRAMADA: 
-    1. Sincronizar coordenadas de juzgados
-    2. Asignar juzgados a clientes pendientes
+    Tarea programada que ejecuta:
+    1. Sincronización de coordenadas de juzgados
+    2. Asignación de juzgados a demandas
     
-    Se ejecuta automáticamente según configuración en celery_app.py
+    EN TODAS LAS BASES DE DATOS
     """
-    # Verificar si el bot puede ejecutarse
+    
+    # Verificar si puede ejecutarse
     can_run, reason = BotController.can_run()
     if not can_run:
-        BotController.log(f"⏭️ Ejecución programada omitida: {reason}", "WARNING")
+        BotController.log(f"⏸️ [SCHEDULED] Ejecución cancelada: {reason}", "WARNING")
         return {
             "status": "skipped",
             "reason": reason,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
         }
     
-    BotController.log("🚀 [AUTO] Iniciando proceso programado completo...", "INFO")
-    
     try:
-        #marcar como ejecutando
         BotController.update_status(BotStatus.RUNNING)
-        
-        #sincronizar juzgados
-        BotController.log("📍 [AUTO] Paso 1/2: Sincronizando juzgados...", "INFO")
+        BotController.log("🤖 [SCHEDULED] Iniciando ejecución programada en todas las BDs", "INFO")
+
+        BotController.log(f"📍 [SCHEDULED] Sincronizando juzgados en {len(DB_NAMES)} BDs...", "INFO")
         sync_court_coordinates()
-        BotController.log("✅ [AUTO] Sincronización completada", "INFO")
+
+        BotController.log(f"⚙️ [SCHEDULED] Procesando asignaciones en {len(DB_NAMES)} BDs...", "INFO")
+        process_pending_lawsuits()
         
-        #asignar clientes
-        BotController.log("⚙️ [AUTO] Paso 2/2: Procesando asignaciones...", "INFO")
+        stats_by_db = {}
+        total_asignados = 0
+        total_sin_direccion = 0
         
-        # Capturar output
-        import io
-        import sys
+        for db_name in DB_NAMES:
+            database_url = get_database_url(db_name)
+            engine = create_engine(database_url, echo=False)
+            
+            with engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN court_name IS NOT NULL 
+                            AND court_name NOT IN ('Sin dirección', 'Error en geocodificación', 
+                                                   'Dirección incorrecta o en otra ciudad', 
+                                                   'No se encuentra juzgado en ciudad')
+                            THEN 1 ELSE 0 END) as asignados,
+                        SUM(CASE WHEN court_name IS NULL 
+                            OR court_name IN ('Sin dirección', 'Error en geocodificación', 
+                                             'Dirección incorrecta o en otra ciudad', 
+                                             'No se encuentra juzgado en ciudad')
+                            THEN 1 ELSE 0 END) as sin_direccion
+                    FROM lawsuit_court_assignments
+                """))
+                stats = result.fetchone()
+                
+                stats_by_db[db_name] = {
+                    "total": stats[0],
+                    "asignados": stats[1],
+                    "sin_direccion": stats[2]
+                }
+                
+                total_asignados += stats[1]
+                total_sin_direccion += stats[2]
         
-        old_stdout = sys.stdout
-        sys.stdout = buffer = io.StringIO()
-        
-        #procesar clientes
-        process_pending_lawsuits(limit=None)
-        
-        output = buffer.getvalue()
-        sys.stdout = old_stdout
-        
-        #detendio
+        #detenido
         BotController.update_status(BotStatus.STOPPED)
-        BotController.log("✅ [AUTO] Proceso programado completado exitosamente", "INFO")
+        BotController.log(
+            f"✅ [SCHEDULED] Ejecución completada - "
+            f"Total asignados: {total_asignados}, Sin dirección: {total_sin_direccion}",
+            "INFO"
+        )
         
         return {
             "status": "success",
-            "type": "scheduled",
-            "timestamp": datetime.now().isoformat()
+            "databases": len(DB_NAMES),
+            "total_asignados": total_asignados,
+            "total_sin_direccion": total_sin_direccion,
+            "stats_by_db": stats_by_db,
+            "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
         }
         
     except Exception as e:
         error_msg = str(e)
         
-        #error por exceder cuotade la api de google maps
+        #cuota excedida
         if "OVER_QUERY_LIMIT" in error_msg or "quota" in error_msg.lower():
             BotController.mark_no_credits()
-            BotController.log(f"❌ [AUTO] Sin créditos de Google Maps API", "ERROR")
+            BotController.log(f"❌ [SCHEDULED] Sin créditos de Google Maps API", "ERROR")
         else:
             BotController.update_status(BotStatus.ERROR, error_msg)
-            BotController.log(f"❌ [AUTO] Error en proceso programado: {error_msg}", "ERROR")
+            BotController.log(f"❌ [SCHEDULED] Error: {error_msg}", "ERROR")
         
-        raise
+        return {
+            "status": "error",
+            "error": error_msg,
+            "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
+        }
 
 
 @celery_app.task(name='app.tasks.manual_execute_bot')
 def manual_execute_bot(limit=None):
     """
-    Tarea MANUAL: Ejecutar bot desde endpoint /execute
-    NO interfiere con las tareas programadas
-    """
-    BotController.log(f"🎯 [MANUAL] Ejecución manual iniciada (limit={limit})", "INFO")
+    Tarea para ejecución manual del bot EN TODAS LAS BDs
     
-    #Verificar si el bot puede ejecutarse
+    Args:
+        limit: Número máximo de demandas a procesar por BD (None = todas)
+    """
+    
     can_run, reason = BotController.can_run()
     if not can_run:
-        BotController.log(f"❌ [MANUAL] Ejecución bloqueada: {reason}", "ERROR")
-        raise Exception(reason)
+        BotController.log(f"⏸️ [MANUAL] Ejecución cancelada: {reason}", "WARNING")
+        return {
+            "status": "skipped",
+            "reason": reason,
+            "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
+        }
     
     try:
-        #Marcar como ejecutando
         BotController.update_status(BotStatus.RUNNING)
+        BotController.log(f"🎯 [MANUAL] Ejecución manual iniciada (limit={limit}) en {len(DB_NAMES)} BDs", "INFO")
         
-        #Sincronizar juzgados primero
-        BotController.log("📍 [MANUAL] Sincronizando juzgados...", "INFO")
+        #procesar en todas las BDs
         sync_court_coordinates()
-        
-        #Procesar asignaciones
-        BotController.log(f"⚙️ [MANUAL] Procesando asignaciones (limit={limit})...", "INFO")
-        
-        import io
-        import sys
-        
-        old_stdout = sys.stdout
-        sys.stdout = buffer = io.StringIO()
-        
         process_pending_lawsuits(limit=limit)
         
-        output = buffer.getvalue()
-        sys.stdout = old_stdout
+        stats_by_db = {}
+        total_asignados = 0
         
-        # Marcar como detenido
+        for db_name in DB_NAMES:
+            database_url = get_database_url(db_name)
+            engine = create_engine(database_url, echo=False)
+            
+            with engine.connect() as connection:
+                result = connection.execute(text("""
+                    SELECT 
+                        SUM(CASE WHEN court_name IS NOT NULL 
+                            AND court_name NOT IN ('Sin dirección', 'Error en geocodificación', 
+                                                   'Dirección incorrecta o en otra ciudad', 
+                                                   'No se encuentra juzgado en ciudad')
+                            THEN 1 ELSE 0 END) as asignados
+                    FROM lawsuit_court_assignments
+                """))
+                asignados = result.fetchone()[0] or 0
+                
+                stats_by_db[db_name] = {"asignados": asignados}
+                total_asignados += asignados
+        
         BotController.update_status(BotStatus.STOPPED)
-        BotController.log(f"✅ [MANUAL] Ejecución manual completada", "INFO")
+        BotController.log(f"✅ [MANUAL] Ejecución completada - Total asignados: {total_asignados}", "INFO")
         
         return {
             "status": "success",
-            "type": "manual",
             "limit": limit,
-            "timestamp": datetime.now().isoformat()
+            "databases": len(DB_NAMES),
+            "total_asignados": total_asignados,
+            "stats_by_db": stats_by_db,
+            "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
         }
         
     except Exception as e:
         error_msg = str(e)
         
-        # Detectar error de cuota excedida
         if "OVER_QUERY_LIMIT" in error_msg or "quota" in error_msg.lower():
             BotController.mark_no_credits()
             BotController.log(f"❌ [MANUAL] Sin créditos de Google Maps API", "ERROR")
@@ -142,29 +181,26 @@ def manual_execute_bot(limit=None):
             BotController.update_status(BotStatus.ERROR, error_msg)
             BotController.log(f"❌ [MANUAL] Error: {error_msg}", "ERROR")
         
-        raise
+        return {
+            "status": "error",
+            "error": error_msg,
+            "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
+        }
+
 
 @celery_app.task(name='app.tasks.reset_daily_api_counter')
 def reset_daily_api_counter():
-    """
-    Resetea el contador de llamadas API diario a medianoche
-    El contador mensual se resetea automáticamente al cambiar de mes
-    """
-    from app.bot_control import BotController
-    
+    """Resetea el contador diario de llamadas API a medianoche"""
     old_count = BotController.reset_daily_counter()
     
-    #Obtener estadísticas actuales
-    usage = BotController.get_api_usage()
-    
     BotController.log(
-        f"📊 Resumen diario - Llamadas: {old_count} | Mes actual: {usage['monthly']['calls']}/{usage['monthly']['limit']}", 
+        f"🔄 [SCHEDULED] Contador diario reseteado automáticamente: {old_count} → 0",
         "INFO"
     )
     
     return {
         "status": "success",
-        "daily_calls_yesterday": old_count,
-        "monthly_calls_total": usage['monthly']['calls'],
-        "timestamp": datetime.now().isoformat()
+        "old_count": old_count,
+        "new_count": 0,
+        "timestamp": datetime.now(COLOMBIA_TZ).isoformat()
     }

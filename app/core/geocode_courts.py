@@ -1,84 +1,39 @@
 import os
-import requests
 import time
 import hashlib
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-import urllib.parse
+from typing import Optional
 
 load_dotenv()
 
-DB_HOST = os.getenv('DB_HOST')
-DB_PORT = os.getenv('DB_PORT', '3306')
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = urllib.parse.quote_plus(os.getenv('DB_PASSWORD'))
-DB_NAME = os.getenv('DB_NAME')
-GOOGLE_API_KEY = os.getenv('GOOGLE_MAPS_API_KEY')
-
-DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+#importar configuración de BD y funciones de API
+from app.utils.database import DB_NAMES, get_database_url
+from app.utils.google_api import geocode_address_with_logging
 
 
 def calculate_court_hash(court_id, address, city):
-    """
-    Calcula un hash único basado en los datos del juzgado
-    
-    Si este hash NO cambia = Los datos son los mismos = NO llamar a API
-    """
+    """Calcula un hash para los datos del juzgado"""
     data_string = f"{court_id}|{address}|{city}"
     return hashlib.sha256(data_string.encode('utf-8')).hexdigest()
 
 
-def geocode_address(address, city):
-    """Geocodifica una dirección usando Google Maps"""
+def sync_court_coordinates_single_db(db_name: str):
+    """
+    Sincroniza coordenadas de juzgados para UNA base de datos específica
     
-    #incrementar contador de llamadas API
+    Args:
+        db_name: Nombre de la base de datos
+    """
     from app.bot_control import BotController
-    BotController.increment_api_calls()
-    
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    full_address = f"{address}, {city}, Colombia"
-    
-    params = {
-        'address': full_address,
-        'key': GOOGLE_API_KEY
-    }
-    
-    try:
-        response = requests.get(url, params=params)
-        data = response.json()
-        
-        if data['status'] == 'OK':
-            location = data['results'][0]['geometry']['location']
-            return location['lat'], location['lng']
-        else:
-            print(f"      ⚠️  Error: {data['status']}")
-            return None, None
-            
-    except Exception as e:
-        print(f"      ❌ Error: {str(e)}")
-        return None, None
-
-
-def sync_court_coordinates():
-    """
-    Sincroniza las coordenadas de los juzgados:
-    1. Sincroniza deleted_at entre data_courts y court_coordinates
-    2. Geocodifica juzgados nuevos (sin coordenadas)
-    3. Actualiza SOLO juzgados que cambiaron de dirección (usando hash)
-    4. Elimina coordenadas de juzgados que ya no existen
-    
-    ✅ OPTIMIZADO: No vuelve a llamar API si los datos no cambiaron
-    """
-    print("=" * 70)
-    print("🔄 SINCRONIZANDO COORDENADAS DE JUZGADOS")
-    print("=" * 70)
-    
-    engine = create_engine(DATABASE_URL, echo=False)
-    
+    print(f"🔄 SINCRONIZANDO JUZGADOS - BD: {db_name}")
+    BotController.log(f"🔄 Iniciando sincronización de juzgados - BD: {db_name}", "INFO")
+    database_url = get_database_url(db_name)
+    engine = create_engine(database_url, echo=False)
     with engine.connect() as connection:
+        
         print("\n1️⃣ Sincronizando deleted_at...")
         
-        # Copiar deleted_at de juzgados inactivos
         sync_deleted_query = text("""
             UPDATE court_coordinates cc
             INNER JOIN data_courts dc ON cc.court_id = dc.id
@@ -91,7 +46,6 @@ def sync_court_coordinates():
         marked_inactive = result.rowcount
         connection.commit()
         
-        # Quitar deleted_at de juzgados rehabilitados
         sync_active_query = text("""
             UPDATE court_coordinates cc
             INNER JOIN data_courts dc ON cc.court_id = dc.id
@@ -105,14 +59,15 @@ def sync_court_coordinates():
         connection.commit()
         
         if marked_inactive > 0:
+            BotController.log(f"✅ [{db_name}] Juzgados marcados como inactivos: {marked_inactive}", "INFO")
             print(f"   ✅ Juzgados marcados como inactivos: {marked_inactive}")
         if marked_active > 0:
+            BotController.log(f"✅ [{db_name}] Juzgados rehabilitados: {marked_active}", "INFO")
             print(f"   ✅ Juzgados rehabilitados: {marked_active}")
         if marked_inactive == 0 and marked_active == 0:
             print(f"   ✅ Todos los deleted_at están sincronizados")
         
-        
-        #eliminar coordenadas que ya no existen
+        #quitar coordenadas huerfanas
         print("\n2️⃣ Limpiando juzgados que ya no existen...")
         delete_query = text("""
             DELETE cc FROM court_coordinates cc
@@ -125,15 +80,14 @@ def sync_court_coordinates():
         connection.commit()
         
         if deleted_count > 0:
+            BotController.log(f"✅ [{db_name}] Eliminadas {deleted_count} coordenadas huérfanas", "INFO")
             print(f"   ✅ Eliminadas {deleted_count} coordenadas huérfanas")
         else:
             print(f"   ✅ No hay coordenadas huérfanas")
         
-        
-        #detectar son el hash si cambiaron de dirección
+        #revisar si hay direcciones actualizadas
         print("\n3️⃣ Detectando juzgados con dirección actualizada...")
         
-        # Obtener todos los juzgados activos con coordenadas
         check_query = text("""
             SELECT 
                 dc.id,
@@ -160,10 +114,8 @@ def sync_court_coordinates():
             current_city = court[3]
             stored_hash = court[4]
             
-            # Calcular hash actual
             current_hash = calculate_court_hash(court_id, current_address, current_city)
             
-            # Si el hash cambió, la dirección cambió
             if stored_hash != current_hash:
                 updated_courts.append({
                     'id': court_id,
@@ -176,6 +128,7 @@ def sync_court_coordinates():
         updated_count = len(updated_courts)
         
         if updated_count > 0:
+            BotController.log(f"⚠️ [{db_name}] {updated_count} juzgados con dirección actualizada", "WARNING")
             print(f"   ⚠️  {updated_count} juzgados con dirección actualizada")
             
             for court in updated_courts:
@@ -188,11 +141,14 @@ def sync_court_coordinates():
                 print(f"\n   📝 {court_name}")
                 print(f"      Nueva dirección: {new_address}, {new_city}")
                 
-                # Re-geocodificar
-                lat, lng = geocode_address(new_address, new_city)
+                #funcion con logging
+                lat, lng, _ = geocode_address_with_logging(
+                    new_address, 
+                    new_city,
+                    db_name=db_name
+                )
                 
                 if lat and lng:
-                    # Actualizar coordenadas Y hash
                     update_coord_query = text("""
                         UPDATE court_coordinates
                         SET latitude = :lat,
@@ -220,7 +176,6 @@ def sync_court_coordinates():
         else:
             print(f"   ✅ No hay direcciones actualizadas")
         
-        
         #geocodificar juzgados nuevos
         print("\n4️⃣ Geocodificando juzgados nuevos...")
         new_query = text("""
@@ -241,12 +196,12 @@ def sync_court_coordinates():
         new_courts = result.fetchall()
         
         new_count = len(new_courts)
+        success_count = 0
+        error_count = 0
         
         if new_count > 0:
+            BotController.log(f"🆕 [{db_name}] {new_count} juzgados nuevos por geocodificar", "INFO")
             print(f"   🆕 {new_count} juzgados nuevos por geocodificar\n")
-            
-            success_count = 0
-            error_count = 0
             
             for i, court in enumerate(new_courts, 1):
                 court_id = court[0]
@@ -258,14 +213,16 @@ def sync_court_coordinates():
                 print(f"   [{i}/{new_count}] {court_name} ({court_cuantia})")
                 print(f"      📍 {court_address}, {court_city}")
                 
-                # Calcular hash
                 court_hash = calculate_court_hash(court_id, court_address, court_city)
-                
-                # Geocodificar
-                lat, lng = geocode_address(court_address, court_city)
+
+                #funcion con logging
+                lat, lng, _ = geocode_address_with_logging(
+                    court_address,
+                    court_city,
+                    db_name=db_name
+                )
                 
                 if lat and lng:
-                    # Guardar en BD con hash
                     insert_query = text("""
                         INSERT INTO court_coordinates 
                         (court_id, latitude, longitude, geocoded_address, data_hash)
@@ -289,16 +246,17 @@ def sync_court_coordinates():
                 time.sleep(0.1)
                 print()
             
+            BotController.log(f"✅ [{db_name}] Nuevos geocodificados: {success_count}", "INFO")
             print(f"   ✅ Nuevos geocodificados: {success_count}")
             if error_count > 0:
+                BotController.log(f"❌ [{db_name}] Errores: {error_count}", "ERROR")
                 print(f"   ❌ Errores: {error_count}")
         else:
             print(f"   ✅ No hay juzgados nuevos")
         
-        
-        #resumen final
+        # Resumen final
         print("\n" + "=" * 70)
-        print("📊 RESUMEN DE SINCRONIZACIÓN")
+        print(f"📊 RESUMEN - BD: {db_name}")
         print("=" * 70)
         
         verify_query = text("""
@@ -327,18 +285,64 @@ def sync_court_coordinates():
         print(f"🔄 Direcciones actualizadas: {updated_count}")
         print(f"🆕 Nuevos geocodificados: {success_count if new_count > 0 else 0}")
         
-        
         skipped_count = len(existing_courts) - updated_count
         if skipped_count > 0:
             print(f"💰 Llamadas API ahorradas: {skipped_count}")
         
         if total_active == total_courts:
+            BotController.log(f"✅ [{db_name}] Todos los juzgados activos están geocodificados", "INFO")
             print("\n✅ Todos los juzgados activos están geocodificados")
         else:
             missing = total_courts - total_active
+            BotController.log(f"⚠️ [{db_name}] {missing} juzgados sin geocodificar", "WARNING")
             print(f"\n⚠️  {missing} juzgados sin geocodificar (probablemente con errores)")
         
         print("=" * 70)
+
+
+def sync_court_coordinates():
+    """
+    Sincroniza coordenadas de juzgados en TODAS las bases de datos configuradas
+    """
+    from app.bot_control import BotController
+    
+    print("\n" + "🌟" * 35)
+    print("🚀 INICIANDO SINCRONIZACIÓN MULTI-BASE DE DATOS")
+    print("🌟" * 35)
+    
+    BotController.log(f"🚀 Iniciando sincronización en {len(DB_NAMES)} bases de datos", "INFO")
+    
+    results = {}
+    
+    for i, db_name in enumerate(DB_NAMES, 1):
+        print(f"\n{'='*70}")
+        print(f"📦 BASE DE DATOS {i}/{len(DB_NAMES)}: {db_name}")
+        print(f"{'='*70}")
+        
+        try:
+            sync_court_coordinates_single_db(db_name)
+            results[db_name] = "✅ SUCCESS"
+        except Exception as e:
+            error_msg = str(e)
+            results[db_name] = f"❌ ERROR: {error_msg}"
+            BotController.log(f"❌ Error en BD {db_name}: {error_msg}", "ERROR")
+            print(f"\n❌ ERROR: {error_msg}")
+    
+    # Resumen de todo
+    print("\n" + "🌟" * 35)
+    print("📊 RESUMEN GLOBAL DE SINCRONIZACIÓN")
+    print("🌟" * 35)
+    
+    for db_name, status in results.items():
+        print(f"{status} - {db_name}")
+    
+    success_count = sum(1 for s in results.values() if "SUCCESS" in s)
+    BotController.log(
+        f"🏁 Sincronización completada: {success_count}/{len(DB_NAMES)} exitosas",
+        "INFO"
+    )
+    
+    print("🌟" * 35)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ LOG_FILE = "logs/bot_execution.log"
 MAX_LOG_LINES = 300
 ROTATION_CHECK_INTERVAL = 50
 
-#Límites de API
+#limites de la api
 MAX_API_CALLS_PER_DAY = 520
 MAX_API_CALLS_PER_MONTH = 5000
 
@@ -174,7 +174,7 @@ class BotController:
         old_count = state.get("api_calls_today", 0)
         
         state["api_calls_today"] = 0
-        state["api_quota_exceeded"] = False  # Resetear solo si era límite diario
+        state["api_quota_exceeded"] = False
         
         BotController.save_state(state)
         BotController.log(f"🔄 Contador diario reseteado: {old_count} → 0", "INFO")
